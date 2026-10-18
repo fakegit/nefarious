@@ -1,7 +1,6 @@
 import os
-
 import requests
-from celery_once import AlreadyQueued
+from celery_singleton import DuplicateTaskError
 from django.conf import settings
 from django.utils.dateparse import parse_date
 from django.utils.decorators import method_decorator
@@ -14,9 +13,11 @@ from rest_framework.authtoken.views import ObtainAuthToken
 from rest_framework.response import Response
 from rest_framework import views
 from rest_framework import exceptions
+from nefarious import events
 from nefarious.api.serializers import (
     WatchMovieSerializer, WatchTVShowSerializer, WatchTVEpisodeSerializer, WatchTVSeasonRequestSerializer, WatchTVSeasonSerializer,
     TransmissionTorrentSerializer, RottenTomatoesSearchResultsSerializer, )
+from nefarious.media_category import MEDIA_CATEGORIES
 from nefarious.models import NefariousSettings, WatchMovie, WatchTVShow, WatchTVEpisode, WatchTVSeasonRequest, WatchTVSeason
 from nefarious.notification import send_message
 from nefarious.opensubtitles import OpenSubtitles
@@ -24,7 +25,8 @@ from nefarious.search import SEARCH_MEDIA_TYPE_MOVIE, SEARCH_MEDIA_TYPE_TV, Sear
 from nefarious.quality import PROFILES
 from nefarious.tasks import (
     import_library_task, completed_media_task, wanted_media_task, auto_watch_new_seasons_task,
-    refresh_tmdb_configuration, wanted_tv_season_task, populate_release_dates_task,
+    refresh_tmdb_configuration, wanted_tv_season_task, populate_release_dates_task, process_stuck_downloads_task,
+    send_media_event_task,
 )
 from nefarious.transmission import get_transmission_client
 from nefarious.tmdb import get_tmdb_client
@@ -227,7 +229,7 @@ class DownloadTorrentsView(views.APIView):
 
         # add torrent
         transmission_client = get_transmission_client(nefarious_settings)
-        transmission_session = transmission_client.session_stats()
+        transmission_session = transmission_client.get_session()
 
         tmdb = get_tmdb_client(nefarious_settings)
 
@@ -244,8 +246,13 @@ class DownloadTorrentsView(views.APIView):
             )
             watch_media.save()
             download_dir = os.path.join(
-                transmission_session.download_dir, nefarious_settings.transmission_movie_download_dir.lstrip('/'))
+                transmission_session.download_dir,
+                settings.UNPROCESSED_PATH,
+                nefarious_settings.transmission_movie_download_dir.lstrip('/'),
+            )
             result['watch_movie'] = WatchMovieSerializer(watch_media).data
+            media_type, data = events.get_media_type_and_serialized_watch_media(watch_media)
+            send_media_event_task.delay(events.ACTION_UPDATED, media_type, data)
         else:
             tmdb_request = tmdb.TV(tmdb_media['id'])
             tmdb_show = tmdb_request.info()
@@ -260,6 +267,8 @@ class DownloadTorrentsView(views.APIView):
             )
 
             result['watch_tv_show'] = WatchTVShowSerializer(watch_tv_show).data
+            media_type, data = events.get_media_type_and_serialized_watch_media(watch_tv_show)
+            send_media_event_task.delay(events.ACTION_UPDATED, media_type, data)
 
             # single episode
             if 'episode_number' in request.data:
@@ -275,6 +284,8 @@ class DownloadTorrentsView(views.APIView):
                 )
                 watch_media.save()
                 result['watch_tv_episode'] = WatchTVEpisodeSerializer(watch_media).data
+                media_type, data = events.get_media_type_and_serialized_watch_media(watch_media)
+                send_media_event_task.delay(events.ACTION_UPDATED, media_type, data)
             # entire season
             else:
                 season_result = tmdb.TV_Seasons(tmdb_show['id'], request.data['season_number'])
@@ -300,9 +311,16 @@ class DownloadTorrentsView(views.APIView):
 
                 # return the season request vs the watch instance
                 result['watch_tv_season_request'] = WatchTVSeasonRequestSerializer(watch_tv_season_request).data
+                media_type, data = events.get_media_type_and_serialized_watch_media(watch_tv_season_request)
+                send_media_event_task.delay(events.ACTION_UPDATED, media_type, data)
+                media_type, data = events.get_media_type_and_serialized_watch_media(watch_media)
+                send_media_event_task.delay(events.ACTION_UPDATED, media_type, data)
 
             download_dir = os.path.join(
-                transmission_session.download_dir, nefarious_settings.transmission_tv_download_dir.lstrip('/'))
+                transmission_session.download_dir,
+                settings.UNPROCESSED_PATH,
+                nefarious_settings.transmission_tv_download_dir.lstrip('/'),
+            )
 
         torrent = transmission_client.add_torrent(
             torrent_url,
@@ -459,14 +477,14 @@ class DiscoverRottenTomatoesMediaView(views.APIView):
         - audience_highest
 
     Examples:
-    https://www.rottentomatoes.com/napi/browse/movies_at_home/genres:action?page=1 ("action" genre, page 1)
-    https://www.rottentomatoes.com/napi/browse/movies_at_home/critics:fresh?page=1 ("fresh", page 1)
-    https://www.rottentomatoes.com/napi/browse/movies_at_home/critics:certified_fresh,fresh?page=1 (fresh OR certified fresh, page 1)
-    https://www.rottentomatoes.com/napi/browse/movies_at_home/sort:popular?page=1 (sort popular)
-    https://www.rottentomatoes.com/napi/browse/movies_at_home/critics:certified_fresh~sort:newest?page=1 (certified fresh, sorted, page 1)
+    https://www.rottentomatoes.com/cnapi/browse/movies_at_home/genres:action?page=1 ("action" genre, page 1)
+    https://www.rottentomatoes.com/cnapi/browse/movies_at_home/critics:fresh?page=1 ("fresh", page 1)
+    https://www.rottentomatoes.com/cnapi/browse/movies_at_home/critics:certified_fresh,fresh?page=1 (fresh OR certified fresh, page 1)
+    https://www.rottentomatoes.com/cnapi/browse/movies_at_home/sort:popular?page=1 (sort popular)
+    https://www.rottentomatoes.com/cnapi/browse/movies_at_home/critics:certified_fresh~sort:newest?page=1 (certified fresh, sorted, page 1)
     """
 
-    API_URL = 'https://www.rottentomatoes.com/napi/browse/{type}/'
+    API_URL = 'https://www.rottentomatoes.com/cnapi/browse/{type}/'
 
     @method_decorator(cache_page(CACHE_DAY))
     def get(self, request, media_type: str):
@@ -493,7 +511,7 @@ class DiscoverRottenTomatoesMediaView(views.APIView):
         body = response.json()
 
         # serialize results
-        results = RottenTomatoesSearchResultsSerializer(body['grids'][0]['list'], many=True).data
+        results = RottenTomatoesSearchResultsSerializer(body['grid']['list'], many=True).data
 
         return Response({
             'url': url,  # include RT url for debugging
@@ -502,10 +520,11 @@ class DiscoverRottenTomatoesMediaView(views.APIView):
 
 
 @method_decorator(gzip_page, name='dispatch')
-class QualityProfilesView(views.APIView):
+class MediaCategoriesView(views.APIView):
 
     def get(self, request):
-        return Response({'profiles': [p.name for p in PROFILES]})
+        media_category_keys = [category[0] for category in MEDIA_CATEGORIES]
+        return Response({'mediaCategories': media_category_keys})
 
 
 class ImportMediaLibraryView(views.APIView):
@@ -516,7 +535,7 @@ class ImportMediaLibraryView(views.APIView):
         try:
             # create task to import library
             import_library_task.delay(media_type, request.user.id)
-        except AlreadyQueued as e:
+        except DuplicateTaskError as e:
             logger_foreground.exception(e)
             msg = 'Import task for {} already exists'.format(media_type)
             logger_foreground.error(msg)
@@ -551,6 +570,8 @@ class QueueTaskView(views.APIView):
             refresh_tmdb_configuration.delay()
         elif request.data['task'] == 'populate_release_dates':
             populate_release_dates_task.delay()
+        elif request.data['task'] == 'process_stuck_downloads':
+            process_stuck_downloads_task.delay()
 
         return Response({'success': True})
 
@@ -560,4 +581,11 @@ class SendNotificationView(views.APIView):
     def post(self, request):
         assert 'message' in request.data, 'missing notification message'
         return Response({'success': send_message(request.data['message'])})
+
+
+@method_decorator(gzip_page, name='dispatch')
+class QualitiesView(views.APIView):
+
+    def get(self, request):
+        return Response([p.name for p in PROFILES])
 

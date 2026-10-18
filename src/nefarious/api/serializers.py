@@ -6,7 +6,7 @@ from rest_framework.exceptions import ValidationError
 from nefarious.models import (
     NefariousSettings, WatchTVEpisode, WatchTVShow, WatchMovie,
     PERM_CAN_WATCH_IMMEDIATELY_TV, PERM_CAN_WATCH_IMMEDIATELY_MOVIE,
-    WatchTVSeason, WatchTVSeasonRequest, TorrentBlacklist,
+    WatchTVSeason, WatchTVSeasonRequest, TorrentBlacklist, QualityProfile,
 )
 
 
@@ -22,17 +22,19 @@ class UserReferenceSerializerMixin(serializers.ModelSerializer):
         return watch_media.user.username
 
 
+class QualityProfileSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = QualityProfile
+        fields = '__all__'
+
+
 class NefariousSettingsSerializer(serializers.ModelSerializer):
     tmdb_configuration = serializers.JSONField(required=False)
     keyword_search_filters = serializers.JSONField(required=False)
     tmdb_languages = serializers.JSONField(required=False)
     jackett_default_token = serializers.ReadOnlyField(default=NefariousSettings.JACKETT_TOKEN_DEFAULT)
-    websocket_url = serializers.SerializerMethodField()
     is_debug = serializers.SerializerMethodField()
     host_download_path = serializers.SerializerMethodField()
-
-    def get_websocket_url(self, obj):
-        return settings.WEBSOCKET_URL
 
     def get_is_debug(self, obj):
         return settings.DEBUG
@@ -52,7 +54,10 @@ class NefariousPartialSettingsSerializer(NefariousSettingsSerializer):
     class Meta:
         model = NefariousSettings
         # only include specific fields
-        fields = ('tmdb_configuration', 'jackett_default_token', 'websocket_url', 'is_debug')
+        fields = (
+            'tmdb_configuration', 'jackett_default_token',
+            'is_debug', 'preferred_media_category',
+        )
 
 
 class WatchMovieSerializer(UserReferenceSerializerMixin, serializers.ModelSerializer):
@@ -157,17 +162,17 @@ class TransmissionTorrentSerializer(serializers.Serializer):
     id = serializers.IntegerField()
     hashString = serializers.CharField()
     name = serializers.CharField()
-    date_active = serializers.DateTimeField()
-    date_added = serializers.DateTimeField()
-    date_done = serializers.DateTimeField()
-    date_started = serializers.DateTimeField()
+    date_active = serializers.DateTimeField(source='activity_date')
+    date_added = serializers.DateTimeField(source='added_date')
+    date_done = serializers.DateTimeField(source='done_date')
+    date_started = serializers.DateTimeField(source='start_date')
     format_eta = serializers.SerializerMethodField()
     progress = serializers.IntegerField()
     status = serializers.CharField()
     files = serializers.SerializerMethodField()
 
     def get_files(self, torrent):
-        return torrent.files()
+        return torrent.get_files()
 
     def get_format_eta(self, torrent):
         return torrent.format_eta()

@@ -1,9 +1,8 @@
 import os
-
 from celery import chain
 from celery.signals import task_failure
-from datetime import datetime
-from celery_once import QueueOnce
+from datetime import datetime, timedelta
+from celery_singleton import Singleton
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.db import IntegrityError
@@ -23,7 +22,7 @@ from nefarious.processors import WatchMovieProcessor, WatchTVEpisodeProcessor, W
 from nefarious.tmdb import get_tmdb_client
 from nefarious.transmission import get_transmission_client
 from nefarious.utils import get_media_new_path_and_name, update_media_release_date, blacklist_media_and_retry
-from nefarious import websocket, notification
+from nefarious import events, notification
 from nefarious.utils import logger_background
 from nefarious.video_detection import VideoDetect
 
@@ -52,6 +51,10 @@ app.conf.beat_schedule = {
         'task': 'nefarious.tasks.populate_release_dates_task',
         'schedule': 60 * 60 * 24 * 1,
     },
+    'Stuck Download Handling': {
+        'task': 'nefarious.tasks.process_stuck_downloads_task',
+        'schedule': 60 * 60 * 24 * 1,
+    },
 }
 
 
@@ -60,12 +63,19 @@ def log_exception(**kwargs):
     logger_background.error('TASK EXCEPTION', exc_info=kwargs['exception'])
 
 
-@app.task(base=QueueOnce, once={'graceful': True})
+@app.task(base=Singleton)
 def watch_tv_show_season_task(watch_tv_season_id: int):
     processor = WatchTVSeasonProcessor(watch_media_id=watch_tv_season_id)
-    success = processor.fetch()
-
     watch_tv_season = get_object_or_404(WatchTVSeason, pk=watch_tv_season_id)
+
+    # skip attempt if media hasn't been released yet
+    if watch_tv_season.release_date and watch_tv_season.release_date > datetime.now().date():
+        logger_background.warning('skipping search for tv season "{}" since it has not been released yet ({})'.format(
+            watch_tv_season, watch_tv_season.release_date))
+        return
+
+    # make attempt
+    success = processor.fetch()
 
     # success so update the season request instance as "collected"
     if success:
@@ -86,13 +96,13 @@ def watch_tv_show_season_task(watch_tv_season_id: int):
         for episode in season['episodes']:
             # save individual episode watches
             watch_tv_episode, was_created = WatchTVEpisode.objects.get_or_create(
-                tmdb_episode_id=episode['id'],
+                watch_tv_show=watch_tv_season.watch_tv_show,
+                season_number=watch_tv_season.season_number,
+                episode_number=episode['episode_number'],
                 # add non-unique constraint fields for the default values
                 defaults=dict(
+                    tmdb_episode_id=episode['id'],
                     user=watch_tv_season.user,
-                    watch_tv_show=watch_tv_season.watch_tv_show,
-                    season_number=watch_tv_season.season_number,
-                    episode_number=episode['episode_number'],
                     release_date=parse_date(episode.get('air_date') or ''),
                 )
             )
@@ -103,13 +113,13 @@ def watch_tv_show_season_task(watch_tv_season_id: int):
         watch_tv_season.delete()
 
 
-@app.task(base=QueueOnce, once={'graceful': True})
+@app.task(base=Singleton)
 def watch_tv_episode_task(watch_tv_episode_id: int):
     processor = WatchTVEpisodeProcessor(watch_media_id=watch_tv_episode_id)
     processor.fetch()
 
 
-@app.task(base=QueueOnce, once={'graceful': True})
+@app.task(base=Singleton)
 def watch_movie_task(watch_movie_id: int):
     processor = WatchMovieProcessor(watch_media_id=watch_movie_id)
     processor.fetch()
@@ -132,7 +142,7 @@ def refresh_tmdb_configuration():
     return nefarious_settings.tmdb_configuration
 
 
-@app.task
+@app.task(base=Singleton)
 def completed_media_task():
     nefarious_settings = NefariousSettings.get()
     transmission_client = get_transmission_client(nefarious_settings)
@@ -159,47 +169,49 @@ def completed_media_task():
 
                 logger_background.info('Media completed: {}'.format(media))
 
-                # run video detection, if enabled, on the relevant video files for movies, staging_path
-                if nefarious_settings.enable_video_detection and isinstance(media, WatchMovie):
+                # get the sub path (e.g. "movies/", "tv/') so we can move the data from staging
+                sub_path = str(
+                    nefarious_settings.transmission_movie_download_dir if isinstance(media, WatchMovie)
+                    else nefarious_settings.transmission_tv_download_dir
+                ).lstrip('/')
+
+                # run video detection, if enabled, on movies and tv seasons
+                if nefarious_settings.enable_video_detection and isinstance(media, (WatchMovie, WatchTVSeason, WatchTVEpisode)):
                     logger_background.info("[VIDEO_DETECTION] verifying '{}'".format(media))
                     staging_path = os.path.join(
-                        settings.INTERNAL_DOWNLOAD_PATH,
-                        settings.UNPROCESSED_PATH,
-                        nefarious_settings.transmission_movie_download_dir.lstrip('/'),
+                        str(settings.INTERNAL_DOWNLOAD_PATH),
+                        str(settings.UNPROCESSED_PATH),
+                        sub_path,
                         torrent.name,
                     )
                     try:
                         if VideoDetect.has_valid_video_in_path(staging_path):
                             logger_background.info("[VIDEO_DETECTION] '{}' has valid video files".format(media))
                         else:
+                            logger_background.error("[VIDEO_DETECTION] blacklisting '{}' because no valid video was found in {}".format(media, staging_path))
+                            notification.send_message('blacklisting media {} because no valid videos found ({}: {})'.format(media, torrent.name, media.transmission_torrent_hash))
                             blacklist_media_and_retry(media)
-                            logger_background.error("[VIDEO_DETECTION] blacklisting '{}' because no valid video was found: {}".format(media, staging_path))
                             continue
                     except Exception as e:
                         logger_background.exception(e)
                         logger_background.error('error during video detection for {} with path {}'.format(media, staging_path))
 
-                # get the sub path (ie. "movies/", "tv/') so we can move the data from staging
-                sub_path = (
-                    nefarious_settings.transmission_movie_download_dir if isinstance(media, WatchMovie)
-                    else nefarious_settings.transmission_tv_download_dir
-                ).lstrip('/')
+                is_torrent_single_file = len(torrent.get_files()) == 1
 
                 # get the path and updated name for the data
-                new_path, new_name = get_media_new_path_and_name(media, torrent.name, len(torrent.files()) == 1)
+                new_path, new_name = get_media_new_path_and_name(media, torrent.name, is_torrent_single_file)
                 relative_path = os.path.join(
-                    sub_path,  # i.e "movies" or "tv"
+                    sub_path,  # e.g. "movies" or "tv"
                     new_path or '',
                 )
 
                 # move the data to a new location
-                transmission_session = transmission_client.session_stats()
                 transmission_move_to_path = os.path.join(
-                    transmission_session.download_dir,
-                    relative_path,
+                    transmission_client.get_session().download_dir, # .e.g. "/downloads"
+                    relative_path,  # e.g. "movies/Batman (2000)/"
                 )
                 logger_background.info('Moving torrent data to "{}"'.format(transmission_move_to_path))
-                torrent.move_data(transmission_move_to_path)
+                transmission_client.move_torrent_data(torrent.id, transmission_move_to_path)
 
                 # rename the data
                 logger_background.info('Renaming torrent file from "{}" to "{}"'.format(torrent.name, new_name))
@@ -223,21 +235,28 @@ def completed_media_task():
                         season_request.collected = True
                         season_request.save()
 
-                # send websocket message media was updated
-                media_type, data = websocket.get_media_type_and_serialized_watch_media(media)
-                websocket.send_message(websocket.ACTION_UPDATED, media_type, data)
+                # publish media updated event
+                media_type, data = events.get_media_type_and_serialized_watch_media(media)
+                events.publish_media_event(events.ACTION_UPDATED, media_type, data)
 
                 # send user notification
                 notification.send_message(message='{} was downloaded'.format(media))
 
                 # define the import path
-                import_path = os.path.join(
-                    settings.INTERNAL_DOWNLOAD_PATH,
-                    relative_path,
-                    # for movies: new_path will be None if the torrent is already a directory so fall back to the new name
-                    # for tv: new_path will be the show, so we really want the new_name which will be the season
-                    new_path or new_name if isinstance(media, WatchMovie) else new_name,
-                )
+                if media_type == MEDIA_TYPE_MOVIE:
+                    import_path = os.path.join(
+                        settings.INTERNAL_DOWNLOAD_PATH,
+                        relative_path,
+                        # torrent is a directory: new_path will be None
+                        # torrent is a single file: relative_path is accurate so don't append anything else
+                        new_path or new_name if not is_torrent_single_file else '',
+                    )
+                else:  # tv
+                    import_path = os.path.join(
+                        settings.INTERNAL_DOWNLOAD_PATH,
+                        relative_path,
+                        new_name,
+                    )
 
                 # post-tasks
                 post_tasks = [
@@ -247,6 +266,7 @@ def completed_media_task():
                         media.user_id,  # user id
                         import_path,
                     ),
+                    remove_completed_torrent_task.si(media_type, media.id),
                 ]
 
                 # conditionally add subtitles task to post-tasks
@@ -258,6 +278,43 @@ def completed_media_task():
 
                 # queue post-tasks
                 chain(*post_tasks)()
+
+
+@app.task
+def remove_completed_torrent_task(media_type: str, watch_media_id: int):
+    nefarious_settings = NefariousSettings.get()
+    if not nefarious_settings.remove_completed_torrents_from_transmission:
+        return
+
+    media_classes = {
+        MEDIA_TYPE_MOVIE: WatchMovie,
+        MEDIA_TYPE_TV_SEASON: WatchTVSeason,
+        MEDIA_TYPE_TV_EPISODE: WatchTVEpisode,
+    }
+    media_class = media_classes.get(media_type)
+    if media_class is None:
+        raise Exception('unknown media_type {} and media_id {} combination'.format(media_type, watch_media_id))
+
+    watch_media = media_class.objects.filter(pk=watch_media_id).first()
+    if not watch_media:
+        raise Exception('missing media for media_type {} and media_id {}'.format(media_type, watch_media_id))
+
+    if not watch_media.transmission_torrent_hash:
+        return
+
+    torrent_hash = watch_media.transmission_torrent_hash
+    try:
+        transmission_client = get_transmission_client(nefarious_settings)
+        transmission_client.remove_torrent([torrent_hash], delete_data=False, timeout=10)
+    except Exception as e:
+        logger_background.warning(str(e))
+        logger_background.warning('could not remove completed torrent from transmission: {}'.format(torrent_hash))
+        return
+
+    watch_media.transmission_torrent_hash = None
+    watch_media.transmission_torrent_name = None
+    watch_media.save()
+    logger_background.info('Removed completed torrent from transmission: {}'.format(torrent_hash))
 
 
 @app.task
@@ -287,8 +344,9 @@ def wanted_media_task():
     today = timezone.now().date()
 
     for media_type, data in wanted_media_data.items():
-        for media in data['query']:
-            # media has been released (or it's missing it's release date so try anyway) so create a task to try and fetch it
+        # process media with the oldest attempt first
+        for media in data['query'].order_by('last_attempt_date'):
+            # media has been released (or it's missing its release date so try anyway) so create a task to try and fetch it
             if not media.release_date or media.release_date <= today:
                 logger_background.info('Wanted {type}: {media}'.format(type=media_type, media=media))
                 # queue task for wanted media
@@ -316,7 +374,7 @@ def wanted_tv_season_task():
             logger_background.warning('(skipping) tmdb error for season request: {}'.format(tv_season_request))
             continue
 
-        now = datetime.utcnow()
+        now = timezone.now()
         last_air_date = parse_date(season.get('air_date') or '')  # season air date
 
         # otherwise add any new episodes to our watch list
@@ -329,11 +387,11 @@ def wanted_tv_season_task():
 
             try:
                 watch_tv_episode, was_created = WatchTVEpisode.objects.get_or_create(
-                    tmdb_episode_id=episode['id'],
+                    watch_tv_show=tv_season_request.watch_tv_show,
+                    season_number=tv_season_request.season_number,
+                    episode_number=episode['episode_number'],
                     defaults=dict(
-                        watch_tv_show=tv_season_request.watch_tv_show,
-                        season_number=tv_season_request.season_number,
-                        episode_number=episode['episode_number'],
+                        tmdb_episode_id=episode['id'],
                         user=tv_season_request.user,
                         release_date=episode_air_date,
                     ))
@@ -359,8 +417,8 @@ def wanted_tv_season_task():
 
 
 @app.task
-def send_websocket_message_task(action: str, media_type: str, data: dict):
-    websocket.send_message(action, media_type, data)
+def send_media_event_task(action: str, media_type: str, data: dict):
+    events.publish_media_event(action, media_type, data)
 
 
 @app.task
@@ -405,9 +463,9 @@ def auto_watch_new_seasons_task():
                 if was_season_created:
                     added_season = True
                     logger_background.info('Automatically watching newly aired season {}'.format(watch_tv_season))
-                    # send a websocket message for this new season
-                    media_type, data = websocket.get_media_type_and_serialized_watch_media(watch_tv_season)
-                    send_websocket_message_task.delay(websocket.ACTION_UPDATED, media_type, data)
+                    # send a media event for this new season
+                    media_type, data = events.get_media_type_and_serialized_watch_media(watch_tv_season)
+                    send_media_event_task.delay(events.ACTION_UPDATED, media_type, data)
 
                     # create a task to download the whole season (fallback to individual episodes if it fails)
                     watch_tv_show_season_task.delay(watch_tv_season.id)
@@ -415,18 +473,18 @@ def auto_watch_new_seasons_task():
         # new season added to show
         if added_season:
             # update auto watch date requested
-            watch_show.auto_watch_date_updated = datetime.utcnow().date()
+            watch_show.auto_watch_date_updated = timezone.now().date()
             watch_show.save()
 
 
-@app.task(base=QueueOnce)
+@app.task(base=Singleton, raise_on_duplicate=True)
 def import_library_task(media_type: str, user_id: int, sub_path: str = None):
     user = get_object_or_404(User, pk=user_id)
     nefarious_settings = NefariousSettings.get()
     tmdb_client = get_tmdb_client(nefarious_settings=nefarious_settings)
 
     if media_type == 'movie':
-        root_path = os.path.join(settings.INTERNAL_DOWNLOAD_PATH, nefarious_settings.transmission_movie_download_dir)
+        root_path = str(os.path.join(settings.INTERNAL_DOWNLOAD_PATH, nefarious_settings.transmission_movie_download_dir))
         importer = MovieImporter(
             nefarious_settings=nefarious_settings,
             root_path=root_path,
@@ -434,7 +492,7 @@ def import_library_task(media_type: str, user_id: int, sub_path: str = None):
             user=user,
         )
     else:
-        root_path = os.path.join(settings.INTERNAL_DOWNLOAD_PATH, nefarious_settings.transmission_tv_download_dir)
+        root_path = str(os.path.join(settings.INTERNAL_DOWNLOAD_PATH, nefarious_settings.transmission_tv_download_dir))
         importer = TVImporter(
             nefarious_settings=nefarious_settings,
             root_path=root_path,
@@ -444,6 +502,9 @@ def import_library_task(media_type: str, user_id: int, sub_path: str = None):
 
     # prefer supplied sub path and fallback to root path
     path = sub_path or root_path
+    # use parent dir if path is a file
+    if os.path.isfile(path):
+        path = os.path.dirname(path)
 
     logger_background.info('Importing {} library at {}'.format(media_type, path))
 
@@ -474,7 +535,7 @@ def populate_release_dates_task():
         try:
             season_result = tmdb_client.TV_Seasons(media.watch_tv_show.tmdb_show_id, media.season_number)
             data = season_result.info()
-            release_date = parse_date(data.get('air_date', ''))
+            release_date = parse_date(data.get('air_date') or '')
             update_media_release_date(media, release_date)
         except Exception as e:
             logger_background.exception(e)
@@ -483,7 +544,7 @@ def populate_release_dates_task():
         try:
             episode_result = tmdb_client.TV_Episodes(media.watch_tv_show.tmdb_show_id, media.season_number, media.episode_number)
             data = episode_result.info()
-            release_date = parse_date(data.get('air_date', ''))
+            release_date = parse_date(data.get('air_date') or '')
             update_media_release_date(media, release_date)
         except Exception as e:
             logger_background.exception(e)
@@ -512,3 +573,29 @@ def queue_download_subtitles_for_season_task(watch_season_id: int):
     watch_season = get_object_or_404(WatchTVSeason, id=watch_season_id)  # type: WatchTVSeason
     for watch_episode in watch_season.watch_tv_show.watchtvepisode_set.filter(season_number=watch_season.season_number):
         download_subtitles_task.delay(MEDIA_TYPE_TV_EPISODE, watch_episode.id)
+
+
+@app.task
+def process_stuck_downloads_task():
+    # find media that's been "stuck" downloading for X days and blacklist (if setting is enabled)
+    nefarious_settings = NefariousSettings.get()
+    if nefarious_settings.stuck_download_handling_enabled:
+        stuck_media_type_queries = [
+            WatchMovie.objects.all(),
+            WatchTVSeason.objects.all(),
+            WatchTVEpisode.objects.all(),
+        ]
+        for query in stuck_media_type_queries:
+            # torrent found, not collected, and older than X days
+            exclude_kwargs = dict(transmission_torrent_hash__isnull=True)
+            filter_kwargs = dict(
+                collected=False,
+                last_attempt_date__lt=timezone.now() - timedelta(days=nefarious_settings.stuck_download_handling_days),
+            )
+            for media in query.exclude(**exclude_kwargs).filter(**filter_kwargs):
+                msg = 'blacklisting stuck media "{media}" since it has been trying to download for longer than {stuck_download_handling_days} days'.format(
+                    media=media, stuck_download_handling_days=nefarious_settings.stuck_download_handling_days,
+                )
+                logger_background.info(msg)
+                notification.send_message(msg)
+                blacklist_media_and_retry(media)

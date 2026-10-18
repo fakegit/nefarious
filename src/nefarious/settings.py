@@ -109,9 +109,9 @@ TIME_ZONE = 'UTC'
 
 USE_I18N = True
 
-USE_L10N = True
-
 USE_TZ = True
+
+DEFAULT_AUTO_FIELD = 'django.db.models.AutoField'
 
 
 # Static files (CSS, JavaScript, Images)
@@ -122,6 +122,9 @@ STATICFILES_DIRS = [
     os.path.join(BASE_DIR, "staticassets"),
 ]
 STATIC_ROOT = "staticfiles"
+
+# serve frontend static assets directly from STATICFILES_DIRS (no collectstatic needed in dev)
+WHITENOISE_USE_FINDERS = True
 
 
 REDIS_HOST = os.environ.get('REDIS_HOST', 'localhost')
@@ -136,8 +139,6 @@ CACHES = {
         }
     }
 }
-
-WEBSOCKET_URL = os.environ.get('WEBSOCKET_HOST', 'ws://nefarious:80/ws')
 
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
@@ -171,12 +172,17 @@ OPENSUBTITLES_API_KEY = 'LG7LMRIL9zfVmF537mxnQDEfN4V7LLqX'
 
 UNPROCESSED_PATH = '.nefarious-unprocessed-downloads'
 
-# container download path (or will be host in development)
+# container download path (or will be the host in development)
 INTERNAL_DOWNLOAD_PATH = os.environ.get('INTERNAL_DOWNLOAD_PATH', '/tmp')
 
 # this is really just an indication to know if the nefarious container was volume mounted with access to the download path.
 # nefarious (celery) will actually use the INTERNAL_DOWNLOAD_PATH (container specific path) to scan for imported media
 HOST_DOWNLOAD_PATH = os.environ.get('HOST_DOWNLOAD_PATH', INTERNAL_DOWNLOAD_PATH if DEBUG else None)
+
+# the number of tasks a worker process will reserve at a time.
+CELERY_WORKER_PREFETCH_MULTIPLIER = 1
+# this ensures the task is acknowledged AFTER it runs, not before.
+CELERY_TASK_ACKS_LATE = True
 
 CONFIG_PATH = os.environ.get('CONFIG_PATH', '/nefarious-db')
 
